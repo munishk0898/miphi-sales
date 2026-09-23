@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=5, user-scalable=yes" />
+<style>
+  html, body { margin: 0; padding: 0; background: #E9E9EB; -webkit-text-size-adjust: 100%; }
+  #pages { padding: 8px 0 56px; }
+  .page { position: relative; margin: 0 auto 10px; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.18); }
+  .page canvas { display: block; width: 100%; height: 100%; }
+  #indicator { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+    background: rgba(35,31,32,0.82); color: #fff; font: 600 13px -apple-system, Roboto, sans-serif;
+    padding: 6px 12px; border-radius: 14px; display: none; }
+  #msg { font: 15px -apple-system, Roboto, sans-serif; color: #555; text-align: center; padding: 40px 24px; }
+</style>
+</head>
+<body>
+<div id="msg"></div>
+<div id="pages"></div>
+<div id="indicator"></div>
+<script>/*PDFJS*/</script>
+<script>
+(function () {
+  var WORKER_SRC = /*WORKER*/"";
+  function post(obj) {
+    try { window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(obj)); } catch (e) {}
+  }
+  try {
+    var blob = new Blob([WORKER_SRC], { type: 'text/javascript' });
+    var blobUrl = URL.createObjectURL(blob);
+    pdfjsLib.GlobalWorkerOptions.workerSrc = blobUrl;
+    pdfjsLib.GlobalWorkerOptions.workerPort = new Worker(blobUrl);
+  } catch (e) {
+    post({ type: 'log', message: 'worker blob failed: ' + e });
+  }
+
+  var chunks = [];
+  var pagesEl = document.getElementById('pages');
+  var indicator = document.getElementById('indicator');
+  var pdfDoc = null;
+  var pageEls = [];
+  var rendered = {};
+  var dpr = Math.min(window.devicePixelRatio || 1, 3);
+
+  window.__pdfChunk = function (c) { chunks.push(c); return true; };
+
+  window.__pdfLoad = function () {
+    var b64 = chunks.join(''); chunks = [];
+    var raw = atob(b64); b64 = null;
+    var bytes = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    raw = null;
+    openPdf(bytes);
+    return true;
+  };
+
+  window.__pdfLoadUrl = function (url) {
+    fetch(url).then(function (r) { return r.arrayBuffer(); })
+      .then(function (buf) { openPdf(new Uint8Array(buf)); })
+      .catch(function (e) { post({ type: 'error', message: String(e) }); });
+    return true;
+  };
+
+  function openPdf(bytes) {
+    pdfjsLib.getDocument({ data: bytes, isEvalSupported: false }).promise.then(function (doc) {
+      pdfDoc = doc;
+      post({ type: 'loaded', pages: doc.numPages });
+      return layout();
+    }).catch(function (e) {
+      document.getElementById('msg').textContent = 'This PDF could not be opened.';
+      post({ type: 'error', message: String(e && e.message || e) });
+    });
+  }
+
+  function layout() {
+    var width = Math.min(document.documentElement.clientWidth, 1400) - 16;
+    var chain = Promise.resolve();
+    for (var n = 1; n <= pdfDoc.numPages; n++) {
+      (function (num) {
+        chain = chain.then(function () {
+          return pdfDoc.getPage(num).then(function (page) {
+            var vp = page.getViewport({ scale: 1 });
+            var el = document.createElement('div');
+            el.className = 'page';
+            el.style.width = width + 'px';
+            el.style.height = Math.round(width * vp.height / vp.width) + 'px';
+            el.dataset.num = String(num);
+            pagesEl.appendChild(el);
+            pageEls.push(el);
+            observer.observe(el);
+          });
+        });
+      })(n);
+    }
+    return chain.then(updateIndicator);
+  }
+
+  function renderPage(el) {
+    var num = Number(el.dataset.num);
+    if (rendered[num]) return;
+    rendered[num] = true;
+    pdfDoc.getPage(num).then(function (page) {
+      var cssW = el.clientWidth;
+      var base = page.getViewport({ scale: 1 });
+      // Render sharper than screen so pinch zoom stays readable.
+      var scale = (cssW / base.width) * dpr * 1.5;
+      var maxPixels = 16000000;
+      if (base.width * base.height * scale * scale > maxPixels) {
+        scale = Math.sqrt(maxPixels / (base.width * base.height));
+      }
+      var vp = page.getViewport({ scale: scale });
+      var canvas = document.createElement('canvas');
+      canvas.width = Math.floor(vp.width);
+      canvas.height = Math.floor(vp.height);
+      var ctx = canvas.getContext('2d');
+      return page.render({ canvasContext: ctx, viewport: vp }).promise.then(function () {
+        if (!rendered[num]) return;
+        el.innerHTML = '';
+        el.appendChild(canvas);
+      });
+    }).catch(function (e) { rendered[num] = false; post({ type: 'log', message: 'render ' + num + ': ' + e }); });
+  }
+
+  function releasePage(el) {
+    var num = Number(el.dataset.num);
+    if (!rendered[num]) return;
+    rendered[num] = false;
+    var c = el.querySelector('canvas');
+    if (c) { c.width = 0; c.height = 0; }
+    el.innerHTML = '';
+  }
+
+  var observer = new IntersectionObserver(function (entries) {
+    entries.forEach(function (en) {
+      if (en.isIntersecting) renderPage(en.target);
+    });
+  }, { rootMargin: '1200px 0px' });
+
+  // Free memory held by pages far outside the screen.
+  var farObserver = null;
+  function sweep() {
+    var h = window.innerHeight;
+    pageEls.forEach(function (el) {
+      var r = el.getBoundingClientRect();
+      if (r.bottom < -h * 5 || r.top > h * 6) releasePage(el);
+    });
+  }
+
+  var hideTimer = null;
+  function updateIndicator() {
+    if (!pdfDoc) return;
+    var mid = window.innerHeight / 2;
+    var current = 1;
+    for (var i = 0; i < pageEls.length; i++) {
+      var r = pageEls[i].getBoundingClientRect();
+      if (r.top <= mid) current = i + 1; else break;
+    }
+    indicator.textContent = current + ' / ' + pdfDoc.numPages;
+    indicator.style.display = 'block';
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(function () { indicator.style.display = 'none'; }, 1800);
+  }
+
+  var sweepTimer = null;
+  window.addEventListener('scroll', function () {
+    updateIndicator();
+    clearTimeout(sweepTimer);
+    sweepTimer = setTimeout(sweep, 400);
+  }, { passive: true });
+
+  post({ type: 'ready' });
+})();
+</script>
+</body>
+</html>
